@@ -248,6 +248,24 @@ pub(crate) fn retire<T: 'static>(object: T) {
         .push((started, Retired(Box::new(object))));
 }
 
+#[cfg(test)]
+fn retire_into<T: 'static>(
+    queue: &Mutex<Vec<(u64, Retired)>>,
+    started: u64,
+    finished: u64,
+    object: T,
+) -> bool {
+    if started <= finished {
+        drop(object);
+        return true;
+    }
+    queue
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push((started, Retired(Box::new(object))));
+    false
+}
+
 /// Whether descriptor slots written again with the object they already
 /// held let the old reference go at once instead of retiring it, and
 /// [`bury`] sorts what it drops outside the lock (`VICTORY_RETIRE_LEAN=1`;
@@ -334,8 +352,12 @@ fn bury(finished: u64) {
         reap(done.into_iter().map(|(_, object)| object).collect());
         return;
     }
+    bury_from(&RETIRED, finished);
+}
+
+fn bury_from(queue: &Mutex<Vec<(u64, Retired)>>, finished: u64) {
     let done: Vec<(u64, Retired)> = {
-        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+        let mut retired = queue.lock().unwrap_or_else(|e| e.into_inner());
         if retired.is_empty() {
             return;
         }
@@ -1489,27 +1511,19 @@ mod tests {
             }
         }
 
-        let was = (super::STARTED.load(super::Ordering::Acquire), super::FINISHED.load(super::Ordering::Acquire));
-        // A submission is running: started, not finished.
-        super::STARTED.store(1, super::Ordering::Release);
-        super::FINISHED.store(0, super::Ordering::Release);
-
+        let queue = super::Mutex::new(Vec::new());
         let dropped = Arc::new(AtomicU64::new(0));
-        super::retire(Mark(dropped.clone()));
+        // A submission is running: started 1, finished 0.
+        assert!(!super::retire_into(&queue, 1, 0, Mark(dropped.clone())));
         assert_eq!(dropped.load(super::Ordering::Relaxed), 0, "held while a submission runs");
-        super::bury(0);
+        super::bury_from(&queue, 0);
         assert_eq!(dropped.load(super::Ordering::Relaxed), 0, "held while that submission is unfinished");
-        super::bury(1);
+        super::bury_from(&queue, 1);
         assert_eq!(dropped.load(super::Ordering::Relaxed), 1, "let go once it finished");
 
         // Nothing running: it goes at once, and nothing is kept.
-        super::STARTED.store(1, super::Ordering::Release);
-        super::FINISHED.store(1, super::Ordering::Release);
-        super::retire(Mark(dropped.clone()));
+        assert!(super::retire_into(&queue, 1, 1, Mark(dropped.clone())));
         assert_eq!(dropped.load(super::Ordering::Relaxed), 2, "nothing was running to wait for");
-
-        super::STARTED.store(was.0, super::Ordering::Release);
-        super::FINISHED.store(was.1, super::Ordering::Release);
     }
 
     #[test]
