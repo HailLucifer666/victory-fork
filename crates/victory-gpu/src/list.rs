@@ -1475,8 +1475,17 @@ extern "system" fn resolve_queries(
         shadow.refresh(list, dst_addr, byte_len);
         shadow.gpu_writes(list, dst_addr, byte_len);
         let dst_offset = shadow.offset(dst_addr);
-        // SAFETY: live command list, query heap, and shadow buffer; range checked above.
+        // SAFETY: live command list, query heap, and shadow buffer (kept in
+        // COMMON between uses); range checked above.
         unsafe {
+            use windows::Win32::Graphics::Direct3D12::{
+                D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST,
+            };
+            list.list.ResourceBarrier(&[crate::host::transition(
+                &shadow.buffer,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )]);
             list.list.ResolveQueryData(
                 &host_heap,
                 query_type,
@@ -1485,6 +1494,11 @@ extern "system" fn resolve_queries(
                 &shadow.buffer,
                 dst_offset,
             );
+            list.list.ResourceBarrier(&[crate::host::transition(
+                &shadow.buffer,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_COMMON,
+            )]);
         }
         return;
     }

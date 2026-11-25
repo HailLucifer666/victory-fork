@@ -158,4 +158,120 @@ mod tests {
         assert_eq!(occlusion_query_type(2), None);
         assert_eq!(occlusion_query_type(3), None);
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn warp_occlusion_query_resolves_zero_samples_into_copy_dest_buffer() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory4};
+        use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+        use windows::core::Interface;
+
+        let factory: IDXGIFactory4 = unsafe { CreateDXGIFactory1() }.expect("DXGI factory");
+        let adapter: IDXGIAdapter = unsafe { factory.EnumWarpAdapter() }.expect("WARP adapter");
+        let mut device: Option<ID3D12Device> = None;
+        unsafe { D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device) }.expect("WARP device");
+        let device = device.unwrap();
+        unsafe {
+            let queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .expect("command queue");
+            let alloc: ID3D12CommandAllocator = device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .expect("allocator");
+            let list: ID3D12GraphicsCommandList = device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)
+                .expect("command list");
+
+            let mut heap: Option<ID3D12QueryHeap> = None;
+            device
+                .CreateQueryHeap(
+                    &D3D12_QUERY_HEAP_DESC {
+                        Type: D3D12_QUERY_HEAP_TYPE_OCCLUSION,
+                        Count: 4,
+                        NodeMask: 0,
+                    },
+                    &mut heap,
+                )
+                .expect("query heap");
+            let heap = heap.unwrap();
+
+            let buf_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 64,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut default_buf: Option<ID3D12Resource> = None;
+            device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &buf_desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut default_buf,
+                )
+                .expect("default buffer");
+            let default_buf = default_buf.unwrap();
+
+            let mut readback: Option<ID3D12Resource> = None;
+            device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_READBACK,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &buf_desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut readback,
+                )
+                .expect("readback buffer");
+            let readback = readback.unwrap();
+
+            list.BeginQuery(&heap, D3D12_QUERY_TYPE_OCCLUSION, 0);
+            list.EndQuery(&heap, D3D12_QUERY_TYPE_OCCLUSION, 0);
+            list.ResourceBarrier(&[crate::host::transition(
+                &default_buf,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            )]);
+            list.ResolveQueryData(&heap, D3D12_QUERY_TYPE_OCCLUSION, 0, 1, &default_buf, 0);
+            list.ResourceBarrier(&[crate::host::transition(
+                &default_buf,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.CopyBufferRegion(&readback, 0, &default_buf, 0, 8);
+            list.Close().expect("close");
+
+            let cmd = [Some(list.cast::<ID3D12CommandList>().unwrap())];
+            queue.ExecuteCommandLists(&cmd);
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).expect("fence");
+            let ev = CreateEventW(None, false, false, None).expect("event");
+            queue.Signal(&fence, 1).expect("signal");
+            fence.SetEventOnCompletion(1, ev).expect("event");
+            WaitForSingleObject(ev, INFINITE);
+
+            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut ptr)).expect("map");
+            let resolved = std::ptr::read_unaligned(ptr.cast::<u64>());
+            readback.Unmap(0, None);
+            assert_eq!(resolved, 0, "empty occlusion query must resolve to 0 samples, not synthetic 1<<20");
+        }
+    }
 }
