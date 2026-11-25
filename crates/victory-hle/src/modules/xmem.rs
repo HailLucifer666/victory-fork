@@ -10,7 +10,7 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 
 use windows_sys::Win32::Foundation::{
@@ -27,6 +27,7 @@ use windows_sys::Win32::System::ProcessStatus::{
     K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
     PROCESS_MEMORY_COUNTERS,
 };
+use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThread};
 use windows_sys::core::BOOL;
 
@@ -498,6 +499,29 @@ fn split_late() -> bool {
 
 const PAGE: usize = 64 << 10;
 
+/// The top of the console's own title memory: 40 bits (the title's BVH
+/// builder refuses a structure above it, decision 0001). A persistent view
+/// is placed at or above this address, so it can never be mistaken for
+/// title memory and can never take an address the title is about to ask
+/// for. The ceiling comes from `GetSystemInfo`, never from a constant:
+/// a host whose application addresses stop below this maps nothing
+/// persistent and every write keeps its temporary view.
+const TITLE_MEMORY_CEILING: usize = 1 << 40;
+
+/// A page's commit state, one `AtomicU8` each. A thread that finds
+/// [`COMMITTING`] waits instead of reading or writing a page whose commit is
+/// still in flight, which is the whole point: `VirtualAlloc(MEM_COMMIT)` is
+/// not atomic with respect to another thread's store into the page.
+const FREE: u8 = 0;
+const COMMITTING: u8 = 1;
+const COMMITTED: u8 = 2;
+
+/// How many times a thread waits for another thread's commit before it gives
+/// up on the persistent path. Giving up is safe (the caller falls back to a
+/// temporary view, which is always correct); only a thread that died
+/// mid-commit can exhaust this, and it must not hang the title.
+const COMMIT_SPINS: usize = 1 << 14;
+
 struct Section {
     handle: HANDLE,
     /// The section's whole range, mapped the first time one of its pages is
@@ -506,12 +530,20 @@ struct Section {
     persistent: OnceLock<Option<MappedBase>>,
     /// The section's size in bytes.
     size: usize,
-    /// One bit per 64 KiB page, set once committed through the persistent
-    /// view. A saved call, not a guarantee: `commit` is idempotent, so the
-    /// DirectStorage workers may write this concurrently and a lost race
-    /// costs one redundant call. It records this view's own commits only;
-    /// the temporary path's are not recorded, by design.
-    committed: Box<[AtomicU64]>,
+    /// One three-state `AtomicU8` per 64 KiB page ([`FREE`], [`COMMITTING`],
+    /// [`COMMITTED`]). Not a saved call: the DirectStorage workers write
+    /// this concurrently, and a page's state leaves `COMMITTING` only after
+    /// `VirtualAlloc` returned, so nobody stores into a page that is not
+    /// committed yet. It records this view's own commits only; the
+    /// temporary path's are not recorded, by design.
+    commit_state: Box<[AtomicU8]>,
+    /// One generation counter per 64 KiB page, bumped after the bytes of that
+    /// page are written (`Section::bump_range`). A consumer that sees a
+    /// bumped counter has, by the release/acquire pair, seen the bytes; that
+    /// is what lets the GPU side skip hashing texture memory it already
+    /// knows (decision 0007's `VICTORY_PAGE_WRITES` counts, phase F's
+    /// digest compares).
+    generation: Box<[AtomicU32]>,
     /// Whether a warn has been said for a write that fell back to a
     /// temporary view, so a run with the switch on can tell which sections
     /// are really persistent.
@@ -534,7 +566,8 @@ impl Section {
             handle,
             persistent: OnceLock::new(),
             size,
-            committed: (0..pages.div_ceil(64)).map(|_| AtomicU64::new(0)).collect(),
+            commit_state: (0..pages).map(|_| AtomicU8::new(FREE)).collect(),
+            generation: (0..pages).map(|_| AtomicU32::new(0)).collect(),
             fallback_noted: OnceLock::new(),
             holding: Mutex::new(Vec::new()),
         }
@@ -589,21 +622,9 @@ impl Section {
     /// allocation can provoke: it asks for 6.1 GiB at once, and this maps
     /// all of it. Callers then keep the temporary view per write.
     fn persistent_ptr(&self) -> Option<*mut u8> {
-        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
-        // SAFETY: our section, mapped read-write; `MappedBase` owns the view
-        // and unmaps it when the section goes.
-        let mapped = self.persistent.get_or_init(|| {
-            let at = unsafe { MapViewOfFile(self.handle, FILE_MAP_WRITE, 0, 0, 0) };
-            if at.Value.is_null() {
-                tracing::warn!(
-                    size = self.size,
-                    error = %std::io::Error::last_os_error(),
-                    "mapping a physical-page section whole failed; its pages keep a temporary view per write"
-                );
-                return None;
-            }
-            Some(MappedBase(at.Value.cast()))
-        });
+        let mapped = self
+            .persistent
+            .get_or_init(|| map_above_title_memory(self.handle, self.size).map(MappedBase));
         mapped.as_ref().map(|base| base.0)
     }
 
@@ -613,36 +634,84 @@ impl Section {
         let Some(end) = start.checked_add(count) else {
             return false;
         };
-        (start..end).all(|page| {
-            (self.committed[page / 64].load(Ordering::Relaxed) >> (page % 64)) & 1 != 0
-        })
+        end <= self.commit_state.len()
+            && (start..end).all(|page| self.commit_state[page].load(Ordering::Acquire) == COMMITTED)
     }
 
-    /// Records pages `[start, start + count)` as committed in the persistent
-    /// view. A lost race only costs a call, so relaxed is enough.
+    /// Records pages as committed. Release: the commit's own work happens
+    /// before anyone who reads this state.
     fn mark_committed(&self, start: usize, count: usize) {
-        for page in start..start + count {
-            self.committed[page / 64].fetch_or(1u64 << (page % 64), Ordering::Relaxed);
+        for page in start..start.saturating_add(count).min(self.commit_state.len()) {
+            self.commit_state[page].store(COMMITTED, Ordering::Release);
         }
     }
 
+    /// Gives claimed pages back after a commit that failed, so the next caller
+    /// retries instead of waiting for this one forever.
+    fn mark_free(&self, start: usize, count: usize) {
+        for page in start..start.saturating_add(count).min(self.commit_state.len()) {
+            let _ = self.commit_state[page].compare_exchange(
+                COMMITTING,
+                FREE,
+                Ordering::Release,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// Bumps the write generation of pages `[first, first + count)`. Call it
+    /// **after** the bytes are written: release ordering puts the bytes before
+    /// the counter, and a consumer that sees the new counter (acquire) sees
+    /// the bytes. Bumping before writing would let a consumer read the new
+    /// generation with the old bytes still in place.
+    fn bump_range(&self, first: usize, count: usize) {
+        let Some(end) = first.checked_add(count) else {
+            return;
+        };
+        for page in first..end.min(self.generation.len()) {
+            self.generation[page].fetch_add(1, Ordering::Release);
+        }
+    }
+
+    /// One number standing for the write generation of pages
+    /// `[start, start + count)`, `None` outside the section.
+// Phase F (the GPU side's texture-hash skip) is the caller; until it
+    // lands, the only caller is the digest test below, so the library build
+    // would otherwise call these unused.
+        #[allow(dead_code)]
+    fn generation_of(&self, start: usize, count: usize) -> Option<u64> {
+        let end = start.checked_add(count)?;
+        if end > self.generation.len() {
+            return None;
+        }
+        let mut digest = 0x9e37_79b9_7f4a_7c15u64;
+        for page in start..end {
+            digest = mix64(digest ^ (page as u64).wrapping_mul(0x2545_f491_4f6c_dd1d));
+            digest = mix64(digest ^ u64::from(self.generation[page].load(Ordering::Acquire)));
+        }
+        Some(digest)
+    }
+
     /// Commits pages `[start_page, start_page + count)` of the persistent
-    /// view at `base`. A page this view committed before costs no call at
-    /// all, which is the point. False when the range leaves the section or
-    /// the host refuses.
+    /// view at `base`. A page already committed costs no call at all, which is
+    /// the point. False when the range leaves the section or the host refuses.
     ///
     /// The bounds check is a real guard, not a saved call: it is what keeps
-    /// `committed_all`'s page arithmetic inside `committed`, and a
-    /// zero-length range past the end is refused by it alone (pinned by
+    /// the page arithmetic inside `commit_state`, and a zero-length range past
+    /// the end is refused by it alone (pinned by
     /// `ensure_committed_refuses_ranges_outside_the_section`).
     ///
-    /// The `committed_all` early return is the one surviving mutation: a
-    /// saved call, not a guard, since `commit` over a committed page
-    /// succeeds and changes nothing. Probe run 2026-11-25 — with the branch
-    /// forced off, `cargo test -p victory-hle xmem::` still passes, so no
-    /// test can see it, and its effect is measured by a run
-    /// (`VICTORY_XMEM_PERSISTENT_VIEW=1`) rather than asserted by one. That
-    /// choice is deliberate and recorded here.
+    /// Between the claim (a page set to `COMMITTING`) and the release of it
+    /// (`COMMITTED`, after `VirtualAlloc` returned) no thread may touch the
+    /// page's bytes: a loser of the claim spins here until the state leaves
+    /// `COMMITTING`. That is the difference between this and a bitmap of
+    /// "committed": `VirtualAlloc(MEM_COMMIT)` is not atomic against another
+    /// thread's store, and the DirectStorage workers write concurrently.
+    ///
+    /// The `committed_all` early return is the surviving saved call: a probe
+    /// (2026-11-25) with the branch forced off still passes every test, since
+    /// `commit` over a committed page succeeds and changes nothing; its effect
+    /// is measured by a run (`VICTORY_XMEM_PERSISTENT_VIEW=1`), not asserted.
     fn ensure_committed(&self, base: *mut u8, start_page: usize, count: usize) -> bool {
         let Some(end_page) = start_page.checked_add(count) else {
             return false;
@@ -656,20 +725,159 @@ impl Section {
         if self.committed_all(start_page, count) {
             return true;
         }
-        // One commit for the whole range: pages committed before are left
-        // as they are. A host at its commit limit is reported here and, if
-        // the caller then retries on the temporary path, reported again by
-        // that path's own `commit` -- two crash-log lines for one failure,
-        // which is asked for rather than avoided: the retry is what gives
-        // the caller the same answer it would have had before.
-        // SAFETY: `[start_page, end_page)` lies inside the section's view.
-        let at = unsafe { base.add(start_page * PAGE) };
-        if !commit(at as usize, count * PAGE) {
-            return false;
+        for _ in 0..COMMIT_SPINS {
+            if self.committed_all(start_page, count) {
+                return true;
+            }
+            // Claim what nobody else is committing. Losing every claim means
+            // another thread owns this range right now: wait for it.
+            let mut claimed = false;
+            for page in start_page..end_page {
+                if self.commit_state[page]
+                    .compare_exchange(FREE, COMMITTING, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    claimed = true;
+                }
+            }
+            if !claimed {
+                std::hint::spin_loop();
+                continue;
+            }
+            // One commit for the whole range: pages committed before are left
+            // as they are. A host at its commit limit is reported here and, if
+            // the caller then retries on the temporary path, reported again by
+            // that path's own `commit` -- two crash-log lines for one failure,
+            // which is asked for rather than avoided: the retry is what gives
+            // the caller the same answer it would have had before.
+            // SAFETY: `[start_page, end_page)` lies inside the section's view.
+            let at = unsafe { base.add(start_page * PAGE) };
+            if !commit(at as usize, count * PAGE) {
+                self.mark_free(start_page, count);
+                return false;
+            }
+            self.mark_committed(start_page, count);
+            return true;
         }
-        self.mark_committed(start_page, count);
-        true
+        // Another thread claimed the range and has not finished after
+        // `COMMIT_SPINS`: give up rather than hang the title. The caller's
+        // temporary view is correct, so this costs speed, not answers.
+        false
     }
+}
+
+/// Mixes a 64-bit word (splitmix64's finaliser): one flipped bit of the input
+/// changes half the output's bits, so two neighbouring pages' generations
+/// cannot cancel out in a fold.
+// Phase F (the GPU side's texture-hash skip) is the caller; until it
+// lands, the only caller is the digest test below, so the library build
+// would otherwise call these unused.
+#[allow(dead_code)]
+fn mix64(value: u64) -> u64 {
+    let mut x = value;
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+/// Whether `at` is a place the persistent view may live: at or above the
+/// title's own memory. Split out from the mapping so the rule has a name a
+/// test can hold, since a host whose allocator is already top-down returns
+/// such an address with or without the requirement.
+fn above_title_memory(at: usize) -> bool {
+    at >= TITLE_MEMORY_CEILING
+}
+
+/// The highest address the host's application may use, less one page: the
+/// upper bound of an address requirement. Asked, never assumed.
+fn highest_ending_address() -> usize {
+    let mut info = SYSTEM_INFO::default();
+    // SAFETY: `GetSystemInfo` writes only into the struct it is given.
+    unsafe { GetSystemInfo(&mut info) };
+    (info.lpMaximumApplicationAddress as usize).saturating_sub(PAGE)
+}
+
+/// Maps `handle`'s whole `size` read-write at or above
+/// [`TITLE_MEMORY_CEILING`], and returns that address; `None` when the host
+/// refuses, which keeps the caller on a temporary view per write.
+///
+/// The address matters: title memory lives below 40 bits, and a view placed
+/// inside that range either takes an address the title is about to ask for
+/// or looks like a title address to the title's own arithmetic. Reserving the
+/// placeholder with `VirtualAlloc2`'s address requirement is how the choice is
+/// made; `MEM_REPLACE_PLACEHOLDER` then maps the section into the reservation
+/// rather than at an address of the host's choosing.
+fn map_above_title_memory(handle: HANDLE, size: usize) -> Option<*mut u8> {
+    let rounded = size.max(PAGE).checked_next_multiple_of(PAGE)?;
+    let mut requirements = MEM_ADDRESS_REQUIREMENTS {
+        LowestStartingAddress: TITLE_MEMORY_CEILING as *mut c_void,
+        HighestEndingAddress: highest_ending_address() as *mut c_void,
+        Alignment: PAGE,
+    };
+    let mut parameter = MEM_EXTENDED_PARAMETER::default();
+    parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
+    parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
+    // SAFETY: the parameter points at `requirements`, which outlives the call.
+    let placeholder = unsafe {
+        VirtualAlloc2(
+            GetCurrentProcess(),
+            std::ptr::null(),
+            rounded,
+            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+            PAGE_NOACCESS,
+            &mut parameter,
+            1,
+        )
+    };
+    if placeholder.is_null() {
+        tracing::warn!(
+            size,
+            error = %std::io::Error::last_os_error(),
+            "reserving a view above the title's own addresses failed; its pages keep a temporary view per write"
+        );
+        return None;
+    }
+    // SAFETY: our reservation, replaced in place by a view of our section.
+    let view = unsafe {
+        MapViewOfFile3(
+            handle,
+            GetCurrentProcess(),
+            placeholder,
+            0,
+            rounded,
+            MEM_REPLACE_PLACEHOLDER,
+            PAGE_READWRITE,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    let at = view.Value as usize;
+    if at != placeholder as usize {
+        // SAFETY: the reservation was not replaced (the mapping failed), so it
+        // is still ours to release.
+        unsafe { VirtualFree(placeholder, 0, MEM_RELEASE) };
+        tracing::warn!(
+            size,
+            error = %std::io::Error::last_os_error(),
+            "mapping a physical-page section whole above the title's addresses failed; its pages keep a temporary view per write"
+        );
+        return None;
+    }
+    if !above_title_memory(at) {
+        // The host ignored the requirement. Using this address is exactly what
+        // the ceiling exists to prevent, so refuse it and take the slow path.
+        // SAFETY: the view just mapped; releasing it also releases the
+        // placeholder, which was not preserved.
+        unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, 0) };
+        tracing::warn!(
+            at = format_args!("{at:#x}"),
+            "the host placed a persistent view inside the title's own addresses; its pages keep a temporary view per write"
+        );
+        return None;
+    }
+    Some(at as *mut u8)
 }
 
 /// The section's whole range, mapped once and unmapped when the section
@@ -1016,7 +1224,6 @@ impl Drop for View {
             // The section's mapping stays; the bytes this view held do not.
             View::Persistent { section, from, len, .. } => section.let_go(*from, *len),
         }
-        }
     }
 }
 
@@ -1051,6 +1258,41 @@ pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
     runs(pages, offset, len).is_some()
 }
 
+/// One number standing for the write generation of bytes `[offset, offset +
+/// len)` of `pages`, or `None` when a page is unknown or `pages` ends early:
+/// equal digests mean no byte of that range was written since the last look,
+/// which is what lets the GPU side skip hashing texture memory it already
+/// knows (`VICTORY_TEXTURE_DIRTY_GEN`, phase F). The release the writer did
+/// before the bump and the acquire here are what make an unchanged digest a
+/// promise about the bytes, not only about the counter.
+// Phase F (the GPU side's texture-hash skip) is the caller; until it
+// lands, the only caller is the digest test below, so the library build
+// would otherwise call these unused.
+#[allow(dead_code)]
+pub(crate) fn physical_generation_digest(
+    pages: &[usize],
+    offset: usize,
+    len: usize,
+) -> Option<u64> {
+    let runs = runs(pages, offset, len)?;
+    let mut within = offset % PAGE;
+    let mut left = len;
+    let mut digest = 0x517c_c1b7_2722_0a95u64;
+    for (slice, n) in &runs {
+        let bytes = (n * PAGE - within).min(left);
+        if bytes == 0 {
+            break;
+        }
+        let folded = slice
+            .section
+            .generation_of(slice.index + within / PAGE, (within + bytes).div_ceil(PAGE))?;
+        digest = mix64(digest ^ folded);
+        left -= bytes;
+        within = 0;
+    }
+    (left == 0).then_some(digest)
+}
+
 /// Copies `data` into physical pages, from `offset` bytes into the first,
 /// whether or not they are mapped anywhere (DirectStorage destinations).
 /// One view per run of consecutive pages, not one per page; with
@@ -1074,6 +1316,12 @@ fn write_physical_with(mapping: Mapping, pages: &[usize], offset: usize, data: &
         };
         let k = (n * PAGE - within).min(data.len() - done);
         view.bytes_at(within, k).copy_from_slice(&data[done..done + k]);
+        // After the bytes, never before: the bump's release ordering is what
+        // lets a consumer that sees the new generation trust the bytes it
+        // reads ([`physical_generation_digest`]).
+        slice
+            .section
+            .bump_range(slice.index + within / PAGE, (within + k).div_ceil(PAGE));
         (within, done) = (0, done + k);
     }
     true
@@ -1086,6 +1334,18 @@ pub(crate) struct PageWindow {
     view: View,
     within: usize,
     len: usize,
+    /// The section the window's bytes live in, and its first page, so the
+    /// window can bump their write generation when it goes: the title writes
+    /// in place, and the drop is the last moment this layer knows of.
+    section: Arc<Section>,
+    first_page: usize,
+}
+
+impl Drop for PageWindow {
+    fn drop(&mut self) {
+        self.section
+            .bump_range(self.first_page, (self.within + self.len).div_ceil(PAGE));
+    }
 }
 
 impl PageWindow {
@@ -1120,6 +1380,8 @@ fn page_window_with(
         view: mapping.view(slice, *n)?,
         within: offset % PAGE,
         len,
+        section: slice.section.clone(),
+        first_page: slice.index + (offset % PAGE) / PAGE,
     })
 }
 
@@ -2055,6 +2317,122 @@ mod tests {
         );
         assert_eq!(XMemFreePhysicalPages(2, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    /// The section's persistent view is placed above the title's own memory
+    /// (phase E). Below that ceiling the host would either hand out an address
+    /// the title is about to ask for, or make our view look like a title
+    /// address to the title's own 40-bit arithmetic (decision 0001).
+    #[test]
+    fn persistent_view_maps_above_the_title_memory_ceiling() {
+        let pages = allocate(2);
+        let section = slice_of(pages[0]).section.clone();
+        let base = section
+            .persistent_ptr()
+            .expect("the host refused a view above 40 bits");
+        assert!(
+            above_title_memory(base as usize),
+            "the persistent view is at {base:p}, inside the title's own addresses"
+        );
+        // The rule itself, which is the part a host cannot be asked to prove:
+        // one page below the ceiling is refused, the ceiling itself is not.
+        // (Removing `LowestStartingAddress` from the reservation does NOT fail
+        // this test on a host whose allocator is already top-down, which this
+        // one is: the requirement is a belt, and this predicate is the pin.)
+        assert!(!above_title_memory(TITLE_MEMORY_CEILING - PAGE));
+        assert!(above_title_memory(TITLE_MEMORY_CEILING));
+        // The view is the section: a write through it lands in the pages a
+        // temporary view of ours reads back.
+        let data: Vec<u8> = (0..PAGE).map(|i| (i * 13 % 251) as u8).collect();
+        assert!(write_physical_with(Mapping::Persistent, &pages[..1], 0, &data));
+        assert_eq!(page_bytes(pages[0]), data);
+        assert_eq!(section.persistent_ptr(), Some(base), "mapped once");
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    /// Eight threads commit the same uncommitted pages at once. Every one of
+    /// them must succeed, and none may store into a page whose commit is still
+    /// in flight: that is the half a "committed" bitmap could not promise,
+    /// because a loser would write while `VirtualAlloc` was still working.
+    #[test]
+    fn concurrent_commit_state_never_exposes_an_uncommitted_page() {
+        let pages = allocate(4);
+        let section = slice_of(pages[0]).section.clone();
+        let base = section
+            .persistent_ptr()
+            .expect("the host refused a view above 40 bits");
+        assert!(!section.committed_all(0, 4), "nothing committed yet");
+        let at = base as usize;
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|worker| {
+                    let section = section.clone();
+                    scope.spawn(move || {
+                        assert!(
+                            section.ensure_committed(at as *mut u8, 0, 4),
+                            "a thread lost the commit race and gave up"
+                        );
+                        // SAFETY: the call above returned true, so the four
+                        // pages are committed; each thread writes a byte of
+                        // its own, so no two touch the same one.
+                        unsafe { (at as *mut u8).add(worker).write_volatile(worker as u8) };
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker.join().expect("no thread panicked");
+            }
+        });
+        assert!(section.committed_all(0, 4), "all four pages committed");
+        // Every thread's byte is there: none was lost or written before its
+        // page was committed.
+        for worker in 0..8u8 {
+            // SAFETY: as above; the byte was written by a joined thread.
+            assert_eq!(unsafe { base.add(usize::from(worker)).read_volatile() }, worker);
+        }
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+    }
+
+    /// The generation digest moves when bytes are written and stays put when
+    /// they are not (phase F's skip rests on the second half). Writes through
+    /// a physical write and through a page window both count.
+    #[test]
+    fn dirty_generation_digest_changes_on_write_and_stays_stable_when_clean() {
+        let pages = allocate(2);
+        let whole = |pages: &[usize]| physical_generation_digest(pages, 0, 2 * PAGE);
+        let clean = whole(&pages).expect("two pages");
+        assert_eq!(whole(&pages), Some(clean), "nothing has been written");
+        let second = physical_generation_digest(&pages, PAGE, PAGE).expect("page two");
+
+        assert!(write_physical(&pages, 0, &[0xA5; 64]));
+        let first_write = whole(&pages).expect("two pages");
+        assert_ne!(Some(first_write), Some(clean), "a write must show");
+        assert_eq!(
+            physical_generation_digest(&pages, PAGE, PAGE),
+            Some(second),
+            "an untouched page's digest moved"
+        );
+        // Writes are counted, not compared: the same bytes written again move
+        // the digest too, which is what makes the counter cheap.
+        assert!(write_physical(&pages, 0, &[0xA5; 64]));
+        assert_ne!(whole(&pages), Some(first_write), "a second write counts");
+
+        // Bytes written in place through a window count when the window goes.
+        let before_window = whole(&pages).expect("two pages");
+        {
+            let mut window = page_window(&pages, 0, 2 * PAGE).expect("one run");
+            window.bytes()[0] = 1;
+        }
+        assert_ne!(
+            whole(&pages),
+            Some(before_window),
+            "a page window's bytes must show"
+        );
+
+        // Unknown pages and ranges past the end are refused.
+        assert_eq!(physical_generation_digest(&[pages[0], 0x10], 0, 2 * PAGE), None);
+        assert_eq!(physical_generation_digest(&pages, 0, 2 * PAGE + 1), None);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
 
     /// Pages say where the title has them mapped, byte for byte (after
