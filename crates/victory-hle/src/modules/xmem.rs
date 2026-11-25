@@ -545,10 +545,14 @@ impl Section {
     /// section's mapping is a single address, so sharing it is sharing a
     /// borrow, and only writers whose bytes are disjoint may do that.
     fn hold(&self, from: usize, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
         let mut holding = self.holding.lock().unwrap_or_else(|e| e.into_inner());
+        let end = from.saturating_add(len);
         if holding
             .iter()
-            .any(|&(at, bytes)| from < at + bytes && at < from + len)
+            .any(|&(at, bytes)| from < at.saturating_add(bytes) && at < end)
         {
             return false;
         }
