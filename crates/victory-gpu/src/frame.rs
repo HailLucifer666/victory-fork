@@ -10,7 +10,7 @@
 //! the clock to presentation if a title paces by them.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -34,6 +34,32 @@ struct Clock {
 
 static CLOCK: Mutex<Option<Clock>> = Mutex::new(None);
 static FRAME: AtomicU64 = AtomicU64::new(0);
+
+/// Where the time comes from and how the wait spends it. Swappable so that the
+/// tests can check the arithmetic in this module; a test that sleeps for real
+/// measures the machine's punctuality, which is the one thing it cannot know.
+#[derive(Clone, Copy, Debug)]
+struct ClockSource {
+    now: fn() -> Instant,
+    sleep: fn(Duration),
+}
+
+static SOURCE: OnceLock<ClockSource> = OnceLock::new();
+
+fn source() -> ClockSource {
+    *SOURCE.get_or_init(|| ClockSource {
+        now: Instant::now,
+        sleep: std::thread::sleep,
+    })
+}
+
+fn now() -> Instant {
+    (source().now)()
+}
+
+fn sleep_for(waited: Duration) {
+    (source().sleep)(waited)
+}
 
 fn clock() -> std::sync::MutexGuard<'static, Option<Clock>> {
     CLOCK.lock().unwrap_or_else(|e| e.into_inner())
@@ -61,7 +87,7 @@ pub(crate) extern "system" fn set_interval(
         .max()
         .unwrap_or(0);
     *clock() = Some(Clock {
-        start: Instant::now(),
+        start: now(),
         interval,
         first,
     });
@@ -98,11 +124,11 @@ fn last(kind: u32) -> &'static AtomicU64 {
 fn next_tick(kind: u32) -> (u64, Duration) {
     let mut clock = clock();
     let c = clock.get_or_insert_with(|| Clock {
-        start: Instant::now(),
+        start: now(),
         interval: SIXTIETH,
         first: 0,
     });
-    let elapsed = c.start.elapsed().as_nanos();
+    let elapsed = now().saturating_duration_since(c.start).as_nanos();
     let interval = c.interval.as_nanos().max(1);
     let tick =
         (c.first + (elapsed / interval + 1) as u64).max(last(kind).load(Ordering::Relaxed) + 1);
@@ -143,10 +169,10 @@ pub(crate) extern "system" fn wait(
         wait = Duration::ZERO;
     }
     let hr = if wait > limit {
-        std::thread::sleep(limit);
+        sleep_for(limit);
         TIMEOUT
     } else {
-        std::thread::sleep(wait);
+        sleep_for(wait);
         last(kind).fetch_max(tick, Ordering::Relaxed);
         S_OK
     };
@@ -201,21 +227,61 @@ pub(crate) extern "system" fn statistics(
 }
 
 #[cfg(test)]
+mod fake {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    static OFFSET: AtomicU64 = AtomicU64::new(0);
+
+    fn now() -> Instant {
+        BASE.get_or_init(Instant::now)
+            .checked_add(Duration::from_nanos(OFFSET.load(Ordering::Relaxed)))
+            .expect("the test clock stays inside Instant's range")
+    }
+
+    fn sleep(waited: Duration) {
+        OFFSET.fetch_add(waited.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// Installs the hand-driven clock. Called once, by the pacing test.
+    pub(super) fn install() {
+        SOURCE
+            .set(ClockSource { now, sleep })
+            .expect("nothing else in this crate installs a clock source");
+    }
+
+    /// Everything the waits asked to sleep for: the pacing cost the test is
+    /// about, as a number rather than as a time of day.
+    pub(super) fn slept() -> Duration {
+        Duration::from_nanos(OFFSET.load(Ordering::Relaxed))
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn waits_end_on_ticks_and_count_frames() {
+        fake::install();
         let null = std::ptr::null();
         assert_eq!(set_interval(null, null, 2_000, 1, 0), S_OK);
         let mut first = 0;
         assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut first), S_OK);
-        let before = Instant::now();
+        let tick_one = LAST[0].load(Ordering::Relaxed);
         let mut second = 0;
         assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut second), S_OK);
-        assert!(second > first);
-        assert!(before.elapsed() <= Duration::from_millis(50));
+        // Each origin wait ends on exactly the next tick, and each tick costs
+        // exactly one interval. On a loaded machine the old version asserted
+        // that two 2 ms waits finished inside 50 ms of wall clock, which is a
+        // claim about the scheduler, not about this code.
+        assert_eq!(LAST[0].load(Ordering::Relaxed), tick_one + 1);
+        assert_eq!(fake::slept(), Duration::from_micros(4_000));
+        assert_eq!(second, first + 1);
         assert_eq!(wait(null, 0, 0, std::ptr::null(), 0, &mut second), TIMEOUT);
+        // A poll asks for no time at all, so it costs none.
+        assert_eq!(fake::slept(), Duration::from_micros(4_000));
         // Tokens count frames, a frame started early on a time-out too.
         let mut early = 0;
         let flags = TOKEN_ON_TIMEOUT;
@@ -244,9 +310,15 @@ mod tests {
                 LAST[2].load(Ordering::Relaxed)
             })
             .collect();
-        assert!(flips.windows(2).all(|w| w[1] == w[0] + 1), "{flips:?}");
+        let base = flips[0];
+        assert_eq!(flips, [base, base + 1, base + 2, base + 3]);
         // Even when a flip wait begins on the tick another just ended on.
         let (tick, _) = next_tick(FLIP);
         assert!(tick > flips[3]);
+        // The whole run, counted: 6 ms of origin waits, then the first flip
+        // ends at once -- the clock is already past the tick it would have
+        // slept to, which is the late-wait shortcut doing its job -- and the
+        // other three flips cost 5 ms each.
+        assert_eq!(fake::slept(), Duration::from_micros(21_000));
     }
 }
