@@ -1472,6 +1472,46 @@ mod tests {
         unsafe { VirtualFree(allocation, 0, MEM_RELEASE); }
     }
 
+    /// A retirement is held while a submission is running, and let go only
+    /// once that submission has finished. The heap of an in-place buffer
+    /// relies on this: the title cannot decommit, free or protect pages a
+    /// standing heap locks, so `VirtualFree` answers error 87 until the host
+    /// has let the heap go.
+    #[test]
+    fn a_retirement_waits_for_the_submission_that_was_running() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+
+        struct Mark(Arc<AtomicU64>);
+        impl Drop for Mark {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, super::Ordering::Relaxed);
+            }
+        }
+
+        let was = (super::STARTED.load(super::Ordering::Acquire), super::FINISHED.load(super::Ordering::Acquire));
+        // A submission is running: started, not finished.
+        super::STARTED.store(1, super::Ordering::Release);
+        super::FINISHED.store(0, super::Ordering::Release);
+
+        let dropped = Arc::new(AtomicU64::new(0));
+        super::retire(Mark(dropped.clone()));
+        assert_eq!(dropped.load(super::Ordering::Relaxed), 0, "held while a submission runs");
+        super::bury(0);
+        assert_eq!(dropped.load(super::Ordering::Relaxed), 0, "held while that submission is unfinished");
+        super::bury(1);
+        assert_eq!(dropped.load(super::Ordering::Relaxed), 1, "let go once it finished");
+
+        // Nothing running: it goes at once, and nothing is kept.
+        super::STARTED.store(1, super::Ordering::Release);
+        super::FINISHED.store(1, super::Ordering::Release);
+        super::retire(Mark(dropped.clone()));
+        assert_eq!(dropped.load(super::Ordering::Relaxed), 2, "nothing was running to wait for");
+
+        super::STARTED.store(was.0, super::Ordering::Release);
+        super::FINISHED.store(was.1, super::Ordering::Release);
+    }
+
     #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
