@@ -39,10 +39,47 @@ pub struct PresenceRead {
 /// call and the test cannot slip past a pattern that only matches when they
 /// are adjacent -- the failure mode this file exists to stop is a check that
 /// is structurally unable to see the thing it polices.
-pub fn presence_only_reads(root: &Path) -> Vec<PresenceRead> {
+pub fn presence_only_reads(root: &Path) -> Result<Vec<PresenceRead>, String> {
+    Ok(scan(root, tracked_rust_files(root)?))
+}
+
+/// The files a workspace guard is about: the ones **git tracks**, and therefore
+/// the ones this repository ships and compiles.
+///
+/// Derived from `git ls-files` rather than by walking the directory. A walk sees
+/// every copy of the tree that happens to be on disk -- `.worktrees/kee-preflight`
+/// while a preflight is running, a vendored checkout, `target/` -- and reports each
+/// duplicate as a defect in code nobody changed. The walk this replaces carried a
+/// skip list (`target`, `.git`, `node_modules`) and missed `.worktrees` the first
+/// day that directory existed, which is what every hand-kept list eventually does:
+/// names a set it can remember instead of the rule it means.
+///
+/// `Err` when git cannot answer. A guard that quietly scans nothing when its input
+/// is unavailable fails open, which is the one direction a guard must never fail.
+fn tracked_rust_files(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-z", "--", "*.rs"])
+        .output()
+        .map_err(|e| format!("cannot run git to list the files this guard is about: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git ls-files failed in {}: {}",
+            root.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .map(|p| root.join(p))
+        .collect())
+}
+
+/// Scans the given files for a switch read for its presence only.
+pub(crate) fn scan(root: &Path, files: impl IntoIterator<Item = PathBuf>) -> Vec<PresenceRead> {
     let mut found = Vec::new();
-    let mut files = Vec::new();
-    collect(root, &mut files);
     for path in files {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
@@ -74,25 +111,6 @@ pub fn presence_only_reads(root: &Path) -> Vec<PresenceRead> {
     found
 }
 
-fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name == "target" || name == ".git" || name == "node_modules" {
-            continue;
-        }
-        if path.is_dir() {
-            collect(&path, out);
-        } else if name.ends_with(".rs") {
-            out.push(path);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,7 +127,8 @@ mod tests {
     /// a switch whose whole purpose is to be turned off.
     #[test]
     fn nothing_reads_a_switch_for_its_presence_only() {
-        let found = presence_only_reads(&workspace_root());
+        let found = presence_only_reads(&workspace_root())
+            .expect("the guard must be able to list the files it is about");
         assert!(
             found.is_empty(),
             "these read an environment variable for its presence, so setting it to 0 \
@@ -146,7 +165,7 @@ mod tests {
              fn f() -> Option<String> {{ std::env::var(\"VICTORY_F\").ok() }}\n"
         );
         std::fs::write(dir.join("src/bad.rs"), src).unwrap();
-        let found = presence_only_reads(&dir);
+        let found = scan(&dir, [dir.join("src/bad.rs")]);
         let names: Vec<&str> = found.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(
             names,
