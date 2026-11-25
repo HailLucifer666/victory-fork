@@ -366,6 +366,40 @@ pub(crate) fn bound_ahead(
     clamp_into(list, c, &dst, budget, src, None, spec, true).then_some(dst)
 }
 
+/// Parses `VICTORY_HOIST_CLAMPS`: **off unless it asks for it**, the
+/// opposite default to `VICTORY_INDIRECT_CLAMP`. Hoisting moves the clamp
+/// dispatches of a run of draws into a list that executes before the draws,
+/// which changes how the title's command lists are parted and submitted; it
+/// stays off until it has been run against a title with clamps, windows and
+/// the relay on together.
+///
+/// Only `"1"`, `"true"`, `"yes"` and `"on"` (ASCII case-insensitive,
+/// trimmed) turn it on. Everything else -- unset, empty, `"0"`, a typo --
+/// leaves the recording exactly as it was before this flag existed, which is
+/// the property the test below pins.
+pub(crate) fn parse_hoist_clamps(value: Option<&std::ffi::OsStr>) -> bool {
+    let Some(text) = value.and_then(std::ffi::OsStr::to_str) else {
+        return false;
+    };
+    let trimmed = text.trim();
+    trimmed == "1"
+        || trimmed.eq_ignore_ascii_case("true")
+        || trimmed.eq_ignore_ascii_case("yes")
+        || trimmed.eq_ignore_ascii_case("on")
+}
+
+// Not called yet: what this flag gates is the list part of the hoisting work,
+// which needs command-list surgery that cannot be checked without running the
+// title. The flag is here first so that the default -- what every existing run
+// gets -- is pinned by a test rather than by a promise.
+#[allow(dead_code)]
+/// Whether the clamps of a run of indirect draws are recorded in a list of
+/// their own before the list that draws (`VICTORY_HOIST_CLAMPS=1`).
+pub(crate) fn hoisting() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| parse_hoist_clamps(std::env::var_os("VICTORY_HOIST_CLAMPS").as_deref()))
+}
+
 /// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
 /// the list left it in; afterwards the list knows it is readable as
 /// indirect arguments.
@@ -2650,5 +2684,21 @@ void work() {
             least.push(runs[0].0);
         }
         assert!(least.iter().all(|us| us.is_finite() && *us > 0.0), "the card gave no time for a batch");
+    }
+
+    /// Hoisting is off unless the switch asks for it, and there is no value
+    /// that turns it on by accident: every run that does not set
+    /// `VICTORY_HOIST_CLAMPS` records exactly what it recorded before the flag
+    /// existed.
+    #[test]
+    fn hoist_clamps_is_off_unless_the_switch_asks_for_it() {
+        use crate::indirect::parse_hoist_clamps;
+        use std::ffi::OsStr;
+        for unset in [None, Some(""), Some("  "), Some("0"), Some("false"), Some("no"), Some("off"), Some("2"), Some("enable"), Some("hoist")] {
+            assert!(!parse_hoist_clamps(unset.map(OsStr::new)), "{unset:?} must not turn hoisting on");
+        }
+        for on in ["1", "true", "TRUE", " yes ", "On", "YES"] {
+            assert!(parse_hoist_clamps(Some(OsStr::new(on))), "{on:?} must turn hoisting on");
+        }
     }
 }
