@@ -1266,7 +1266,6 @@ mod title_memory_tests {
         assert_eq!(super::subresource_len(1024, 256, 4, 1, 896), 0);
     }
 
-    #[test]
     /// The overflow half of `readable`, asserted where it happens rather than
     /// through its answer: for a range that runs off the end of the address
     /// space, saturating and refusing produce the same `(0, 1)`, so the
@@ -1297,6 +1296,7 @@ mod title_memory_tests {
         );
     }
 
+    #[test]
     fn readable_and_query_reject_overflow_noaccess_and_guard_pages() {
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_GUARD, PAGE_NOACCESS, PAGE_READWRITE,
