@@ -2122,6 +2122,7 @@ pub(crate) fn dred_mode() -> Dred {
             Some(_) => Dred::Full,
         }
     })
+}
 
 /// Parses an opt-in boolean environment variable. Unset, empty/whitespace,
 /// `"0"`, `"false"`, `"no"`, and `"off"` (ASCII case-insensitive) disable
@@ -2143,9 +2144,12 @@ pub(crate) fn parse_env_flag(value: Option<&std::ffi::OsStr>) -> bool {
 }
 
 /// Whether the opt-in boolean environment variable `name` is enabled.
+///
+/// Re-exported crate-wide so the rest of the tree ([`crate::env_flag`]) asks
+/// the same question `0`, `false`, `no` and `off` the same way, instead of
+/// `var_os(..).is_some()` answering only "was it set at all".
 pub fn env_flag(name: &str) -> bool {
     parse_env_flag(std::env::var_os(name).as_deref())
-}
 }
 
 /// Whether device-removed data is on in its full form (`VICTORY_D3D12_DRED`
