@@ -1258,6 +1258,40 @@ pub(crate) fn pages_known(pages: &[usize], offset: usize, len: usize) -> bool {
     runs(pages, offset, len).is_some()
 }
 
+/// Registers [`va_generation_digest`] as the GPU crate's page-generation oracle.
+pub fn register_page_gen_oracle() {
+    victory_gpu::set_page_gen_oracle(va_generation_digest);
+}
+
+/// Folded write generation for `[addr, addr + len)` across mapped physical-page
+/// views, or `None` when any byte lies outside a known `xmem` view.
+pub fn va_generation_digest(addr: usize, len: usize) -> Option<u64> {
+    if len == 0 {
+        return None;
+    }
+    let end = addr.checked_add(len)?;
+    let phys = physical();
+    let mut cursor = addr;
+    let mut digest = 0x517c_c1b7_2722_0a95u64;
+    while cursor < end {
+        let (&base, (vlen, slice)) = phys.views.range(..=cursor).next_back()?;
+        let view_end = base.checked_add(*vlen)?;
+        if view_end <= cursor {
+            return None;
+        }
+        let within = cursor - base;
+        let take = (view_end - cursor).min(end - cursor);
+        let first_page = slice.index + within / PAGE;
+        let page_count = ((within % PAGE) + take).div_ceil(PAGE);
+        let folded = slice.section.generation_of(first_page, page_count)?;
+        digest = mix64(digest ^ (Arc::as_ptr(&slice.section) as usize as u64));
+        digest = mix64(digest ^ (first_page as u64));
+        digest = mix64(digest ^ folded);
+        cursor += take;
+    }
+    Some(digest)
+}
+
 /// One number standing for the write generation of bytes `[offset, offset +
 /// len)` of `pages`, or `None` when a page is unknown or `pages` ends early:
 /// equal digests mean no byte of that range was written since the last look,
@@ -2732,6 +2766,30 @@ mod tests {
         // true here and the call succeeds, so this pins the clause the host
         // would otherwise supply the answer for.
         assert!(!section.ensure_committed(base, 3, 0));
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn va_generation_digest_tracks_mapped_views_and_rejects_gaps() {
+        let pages = allocate(2);
+        let va = XMemVirtualAlloc(std::ptr::null_mut(), 2 * PAGE, MEM_RESERVE | PAGES_64K, 0, 0x04);
+        assert!(!va.is_null());
+        assert_eq!(XMemMapPhysicalPages(va, 2, pages.as_ptr()), va);
+        let addr = va as usize;
+
+        let d0 = va_generation_digest(addr, 2 * PAGE).expect("mapped view has digest");
+        assert_eq!(va_generation_digest(addr, 2 * PAGE), Some(d0));
+        // Writing through physical pages bumps the generation and changes the VA digest.
+        assert!(write_physical(&pages, 0, &[0xAB; 64]));
+        let d1 = va_generation_digest(addr, 2 * PAGE).expect("still mapped");
+        assert_ne!(d1, d0);
+        // Unmapped / past-end ranges return None so the caller falls back to BLAKE3.
+        assert!(va_generation_digest(addr, 3 * PAGE).is_none());
+        assert!(va_generation_digest(addr, 0).is_none());
+
+        assert_eq!(XMemMapPhysicalPages(va, 2, std::ptr::null()), va);
+        assert!(va_generation_digest(addr, 2 * PAGE).is_none());
+        assert_ne!(unsafe { VirtualFree(va, 0, 0x8000) }, 0);
         assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
 }
